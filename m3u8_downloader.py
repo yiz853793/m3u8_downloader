@@ -7,12 +7,6 @@ from Crypto.Cipher import AES
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configurations
-M3U8_URL = "https://vip5.3sybf.com/20210505/4M72zz6U/2000kb/hls/index.m3u8"
-OUTPUT_FILE = "output.mp4"
-TEMP_DIR = "temp_ts"
-MAX_THREAD = 10
-
 def download_file(url, filename, retries=5, timeout=10):
     """ Download a file from a URL with retries """
     for attempt in range(retries):
@@ -51,22 +45,22 @@ def decrypt_ts(encrypted_ts, key, iv):
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return cipher.decrypt(encrypted_ts)
 
-def download_segment(m3u8_url, segment, idx) :
+def download_segment(m3u8_url, segment, temp_dir, idx, retries = 5, timeout = 10) :
     key_info = None
     segment_url = segment.uri
     segment_url = urljoin(m3u8_url, segment_url)
-    ts_filename = os.path.join(TEMP_DIR, f"{idx}.ts")
+    ts_filename = os.path.join(temp_dir, f"{idx}.ts")
 
     # Handle encryption if needed
     if segment.key.uri:
                     
         key_url = urljoin(m3u8_url, segment.key.uri)
-        key = get_key(key_url)
+        key = get_key(key_url, retries=retries, timeout= timeout)
         iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
         key_info = (key, iv)  # Save key for decryption
         # print(key_info[0])
 
-    if download_file(segment_url, ts_filename) :
+    if download_file(segment_url, ts_filename, retries=retries, timeout=timeout) :
 
         if key_info:
         # Decrypt if encrypted
@@ -81,14 +75,14 @@ def download_segment(m3u8_url, segment, idx) :
     else:
         return None
 
-def process_m3u8(m3u8_url, retries=5):
+def process_m3u8(m3u8_url,temp_dir, thread, retries=5, timeout = 10):
     """ Process M3U8 playlist and download segments using multi-threading """
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
     
     playlist = None
     for attempt in range(retries):
         try:
-            playlist = m3u8.load(m3u8_url)
+            playlist = m3u8.load(m3u8_url, timeout=timeout)
             break  # Successfully loaded M3U8
         except Exception as e:
             print(f"Error loading {m3u8_url} at attempt {attempt}: {e}")    
@@ -98,9 +92,9 @@ def process_m3u8(m3u8_url, retries=5):
         return []
 
     segment_files = []
-    with ThreadPoolExecutor(max_workers=MAX_THREAD) as executor:
+    with ThreadPoolExecutor(max_workers=thread) as executor:
         future_to_index = {
-            executor.submit(download_segment, m3u8_url, segment, idx): idx
+            executor.submit(download_segment, m3u8_url, segment, temp_dir, idx, retries, timeout): idx
             for idx, segment in enumerate(playlist.segments)
         }
 
@@ -126,20 +120,43 @@ def merge_segments(segment_files, output_file):
           .run(overwrite_output=True)
 
     print(f"Saved output as {output_file}")
-    os.remove(concat_list_path)
 
-def cleanup():
+def cleanup(temp_dir):
     """ Remove temporary TS files """
-    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    os.remove("concat_list.txt")
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="M3U8 Downloader and Merger")
+    parser.add_argument("-i", "--input", required=True, help="M3U8 playlist URL")
+    parser.add_argument("-o", "--output", default="output.mp4", help="Output MP4 file name")
+    parser.add_argument("-t", "--tempdir", default="temp_ts", help="Temporary directory for TS files")
+    parser.add_argument("-w", "--workers", type=int, default=10, help="Number of threads for downloading segments")
+    parser.add_argument("-r", "--retries", type=int, default=5, help="Number of retries for each download")
+    parser.add_argument("-to", "--timeout", type=int, default=10, help="Timeout for requests in seconds")
+    parser.add_argument("--clean", action="store_true", help="Clean up temporary directory after merging")
+
+    args = parser.parse_args()
+
+    m3u8_url = args.input
+    output_file = args.output
+    temp_dir = args.tempdir
+    max_thread = args.workers
+    retries = args.retries
+    timeout = args.timeout
+    clean = args.clean
+
+    print(args)
     print("Downloading and processing M3U8 playlist...")
-    segments = process_m3u8(M3U8_URL)
+    segments = process_m3u8(m3u8_url, temp_dir, max_thread)
 
     print("Merging segments into MP4...")
-    merge_segments(segments, OUTPUT_FILE)
+    merge_segments(segments, output_file)
 
-    print("Cleaning up...")
-    cleanup()
+    if clean:
+        print("Cleaning up...")
+        cleanup(temp_dir)
 
-    print(f"Done! The video is saved as {OUTPUT_FILE}")
+    print(f"Done! The video is saved as {output_file}")
