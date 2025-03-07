@@ -10,186 +10,232 @@ import time
 import threading
 import logging
 import argparse
+from typing import List, Optional
+from m3u8 import Segment
 
-# Simulate browser
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0'
-}
+class M3U8downloader:
 
-# Global variables
-m3u8_url = 'example.m3u8'
-output_file = 'video.mp4'
-temp_dir = 'temp_ts'
-max_thread = 8
-retries = 5
-timeout = 10
-clean = False
-logger_on = False
-total_segments = 0
-downloaded_segments = 0
-downloaded_bytes = 0
-wr_lock = threading.Lock()
-byte_lock = threading.Lock()
-finish_download = False
+    def __init__(self,
+                 m3u8_url: str = 'example.m3u8',
+                 output_file: str = 'video.mp4',
+                 temp_dir: str = 'temp_ts',
+                 max_thread: int = 8,
+                 retries: int = 5,
+                 timeout: int = 10,
+                 clean: bool = False,
+                 logger_on: bool = False,
+                 headers: dict = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0'
+                 },
+                 concat_file: str = 'concat_list.txt'
+                ):
+        self.headers = headers
+        self.m3u8_url = m3u8_url
+        self.output_file = output_file
+        self.temp_dir = temp_dir
+        self.max_thread = max_thread
+        self.retries = retries
+        self.timeout = timeout
+        self.clean = clean
+        self.logger_on = logger_on
+        self.concat_file = concat_file
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+        self.__total_segments: int = 0
+        self.__downloaded_segments: int = 0
+        self.__downloaded_bytes: int = 0
+        self.__wr_lock: threading.Lock = threading.Lock()
+        self.__byte_lock: threading.Lock = threading.Lock()
+        self.__finish_download: threading.Event = threading.Event()  # Use threading.Event for thread safety
 
-def format_speed(bytes_per_sec):
-    """Format speed to suitable unit."""
-    units = ["B/s", "KB/s", "MB/s", "GB/s"]
-    unit_index = 0
-    while bytes_per_sec >= 1024 and unit_index < len(units) - 1:
-        bytes_per_sec /= 1024
-        unit_index += 1
-    return f"{bytes_per_sec:.2f} {units[unit_index]}"
+        self.__key_cache: dict = {}
+        self.__key_cache_lock: threading.Lock = threading.Lock()
+        # Configure logging
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)
 
-def monitor_speed():
-    """Monitor and display download speed every second."""
-    global downloaded_bytes
+    def _format_speed_(self, bytes_per_sec: int) -> str:
+        """Format speed to suitable unit."""
+        units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        unit_index = 0
+        while bytes_per_sec >= 1024 and unit_index < len(units) - 1:
+            bytes_per_sec /= 1024
+            unit_index += 1
+        return f"{bytes_per_sec:.2f} {units[unit_index]}"
 
-    while not finish_download:
-        time.sleep(1)
-        with wr_lock:
-            logger.info(f"\033[96mDownload Speed: {format_speed(downloaded_bytes)}\033[0m")
-            downloaded_bytes = 0  # Reset counter every second
+    def _monitor_speed_(self) -> None:
+        """Monitor and display download speed every second."""
+        while not self.__finish_download.is_set():  # Use is_set() to check the state of the Event
+            time.sleep(1)
+            with self.__wr_lock:
+                self.logger.info(f"\033[96mDownload Speed: {self._format_speed_(self.__downloaded_bytes)}\033[0m")
+                self.__downloaded_bytes = 0  # Reset counter every second
 
-def download_file(url: str, filename: str, retries=5, timeout=10):
-    """Download a file from a URL with retries."""
-    global downloaded_bytes
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, stream=True, timeout=timeout, headers=headers)
-            if response.status_code == 200:
-                with open(filename, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                        with byte_lock:
-                            downloaded_bytes += len(chunk)
-                if logger_on : logger.info(f"Downloaded: {url}; Saved in {filename}")
-                return True  # Success
-            else:
-                if logger_on : logger.error(f"Failed to download {url} at {attempt}th try, Status Code: {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            if logger_on:
-                logger.error(f"Error downloading {url} at {attempt}th try: {e}")
-    
-    logger.error(f"\033[91mFailed to download {url} after {retries} attempts, whitch should stored in {filename}\033[0m")
-    return False  # Failed after retries
-
-def get_key(key_url: str, retries=5, timeout=10):
-    """Download the AES decryption key."""
-    for attempt in range(retries):
-        try:
-            response = requests.get(key_url, stream=True, timeout=timeout, headers=headers)
-            if response.status_code == 200:
-                return response.content
-            else:
-                if logger_on : logger.error(f"Failed to download key: {key_url}, Status Code: {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            if logger_on : logger.error(f"Error downloading {key_url} at {attempt}th try: {e}")
-
-    return None
-
-def decrypt_ts(encrypted_ts, key, iv):
-    """Decrypt a TS file using AES-128."""
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    return cipher.decrypt(encrypted_ts)
-
-def download_segment(m3u8_url: str, segment, temp_dir: str, profix: str, idx: int, retries=5, timeout=10):
-    """Download a segment and decrypt if needed."""
-    global downloaded_segments, total_segments
-    key_info = None
-    segment_url = segment.uri
-    segment_url = urljoin(m3u8_url, segment_url)
-
-    path = urlparse(segment_url).path  # Get the path part of the URL
-    ext = os.path.splitext(path)[-1]   # Extract extension from path
-    
-    if ext != '.mp4':
-        ext = '.ts'
-
-    ts_filename = os.path.join(temp_dir, f"{profix}{idx}{ext}")
-
-    # Handle encryption if needed
-    if segment.key and segment.key.uri:
-        key_url = urljoin(m3u8_url, segment.key.uri)
-        key = get_key(key_url, retries=retries, timeout=timeout)
-        iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
-        key_info = (key, iv)  # Save key for decryption
-
-    if download_file(segment_url, ts_filename, retries=retries, timeout=timeout):
-        if key_info:
-            # Decrypt if encrypted
-            with open(ts_filename, "rb") as f:
-                encrypted_data = f.read()
-                decrypted_data = decrypt_ts(encrypted_data, key_info[0], key_info[1])
-
-                with open(ts_filename, "wb") as f:
-                    f.write(decrypted_data)
-                if logger_on : logger.info(f'Decrypted {segment_url}')
+    def _download_file_(self, url: str, filename: str) -> bool:
+        """Download a file from a URL with retries."""
+        for attempt in range(self.retries):
+            try:
+                response = requests.get(url, stream=True, timeout=self.timeout, headers=self.headers)
+                if response.status_code == 200:
+                    with open(filename, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                            with self.__byte_lock:
+                                self.__downloaded_bytes += len(chunk)
+                    if self.logger_on:
+                        self.logger.info(f"Downloaded: {url}; Saved in {filename}")
+                    time.sleep(1)
+                    return True  # Success
+                else:
+                    if self.logger_on:
+                        self.logger.error(f"Failed to download {url} at {attempt}th try, Status Code: {response.status_code}")
+                    time.sleep(2 * (attempt + 1))
+            except requests.exceptions.RequestException as e:
+                if self.logger_on:
+                    self.logger.error(f"Error downloading {url} at {attempt}th try: {e}")
+                time.sleep(2 * (attempt + 1))
         
-        with wr_lock:
-            downloaded_segments += 1
-        
-        logger.info(f'\033[92m{downloaded_segments}/{total_segments}\033[0m Downloaded and Saved {segment_url}')
-        return ts_filename
-    else:
+        self.logger.error(f"\033[91mFailed to download {url} after {self.retries} attempts, whitch should stored in {filename}\033[0m")
+        return False  # Failed after retries
+
+    def _get_key_(self, key_url: str) -> Optional[bytes]:
+        """Download the AES decryption key."""
+        for attempt in range(self.retries):
+            try:
+                response = requests.get(key_url, stream=True, timeout=self.timeout, headers=self.headers)
+                if response.status_code == 200:
+                    return response.content
+                else:
+                    if self.logger_on:
+                        self.logger.error(f"Failed to download key: {key_url}, Status Code: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                if self.logger_on:
+                    self.logger.error(f"Error downloading {key_url} at {attempt}th try: {e}")
+        self.logger.error(f'\033[91mFailed to download key: {key_url} after {self.retries} try\033[0m')
+
         return None
 
-def process_m3u8(m3u8_url: str, temp_dir: str, profix: str, thread: int, retries=5, timeout=10):
-    """Process M3U8 playlist and download segments using multi-threading."""
-    os.makedirs(temp_dir, exist_ok=True)
+    def _decrypt_ts_(self, encrypted_ts: bytes, key: bytes, iv: bytes) -> bytes:
+        """Decrypt a TS file using AES-128."""
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        return cipher.decrypt(encrypted_ts)
 
-    global total_segments
-    playlist = None
-    for attempt in range(retries):
-        try:
-            playlist = m3u8.load(m3u8_url, timeout=timeout, headers=headers)
-            break  # Successfully loaded M3U8
-        except Exception as e:
-            if logger_on : logger.error(f"Error loading {m3u8_url} at attempt {attempt}: {e}")    
+    def _download_segment_(self, segment : Segment, idx: int) -> Optional[str]:
+        """Download a segment and decrypt if needed."""
+        key_info = None
+        segment_url = segment.uri
+        segment_url = urljoin(self.m3u8_url, segment_url)
 
-    if not playlist:
-        if logger_on : logger.error("Failed to load M3U8 file.")
-        return []
-    
-    total_segments = len(playlist.segments)
-    segment_files = []
-    with ThreadPoolExecutor(max_workers=thread) as executor:
-        future_to_index = {
-            executor.submit(download_segment, m3u8_url, segment, temp_dir, profix, idx, retries=retries, timeout=timeout): idx
-            for idx, segment in enumerate(playlist.segments)
-        }
+        path = urlparse(segment_url).path  # Get the path part of the URL
+        ext = os.path.splitext(path)[-1]   # Extract extension from path
+        
+        if ext != '.mp4':
+            ext = '.ts'
 
-        for future in as_completed(future_to_index):
-            ts_filename = future.result()
-            if ts_filename:
-                segment_files.append((future_to_index[future], ts_filename))
-                if logger_on : logger.info(f'Downloaded file {ts_filename}')
+        ts_filename = os.path.join(self.temp_dir, f"{idx}{ext}")
 
-    # Sort files by index to maintain order
-    segment_files.sort()
-    return [filename for _, filename in segment_files]
+        # Handle encryption if needed
+        if segment.key and segment.key.uri:
+            key_url = urljoin(self.m3u8_url, segment.key.uri)
+            if key_url in self.__key_cache:
+                key_info = self.__key_cache[key_url]
+            
+            key = self._get_key_(key_url)
 
-def merge_segments(segment_files, output_file):
-    """Merge TS segments into an MP4 file using FFmpeg."""
-    concat_list_path = "concat_list.txt"
-    with open(concat_list_path, "w") as f:
-        for segment in segment_files:
-            f.write(f"file '{segment}'\n")
+            if key:
+                iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
+                key_info = (key, iv)  # Save key for decryption
+                with self.__key_cache_lock:
+                    self.__key_cache[key_url] = key_info
+            else:
+                return None
 
-    ffmpeg.input(concat_list_path, format="concat", safe=0) \
-          .output(output_file, c="copy") \
-          .run(overwrite_output=True)
+        if self._download_file_(segment_url, ts_filename):
+            if key_info:
+                # Decrypt if encrypted
+                with open(ts_filename, "rb") as f:
+                    encrypted_data = f.read()
+                    decrypted_data = self._decrypt_ts_(encrypted_data, key_info[0], key_info[1])
 
-    if logger_on : logger.info(f"Saved output as {output_file}")
+                    with open(ts_filename, "wb") as f:
+                        f.write(decrypted_data)
+                    if self.logger_on:
+                        self.logger.info(f'Decrypted {segment_url}')
+            
+            with self.__wr_lock:
+                self.__downloaded_segments += 1
+            
+            self.logger.info(f'\033[92m{self.__downloaded_segments}/{self.__total_segments}\033[0m Downloaded and Saved {segment_url}')
+            return ts_filename
+        else:
+            return None
 
-def cleanup(temp_dir):
-    """Remove temporary TS files."""
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    os.remove("concat_list.txt")
+    def process_m3u8(self) -> List[str]:
+        """Process M3U8 playlist and download segments using multi-threading."""
+
+        # Start download speed monitoring in a separate thread
+        speed_thread = threading.Thread(target=self._monitor_speed_, daemon=True)
+        speed_thread.start()
+
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+        playlist = None
+        for attempt in range(self.retries):
+            try:
+                playlist = m3u8.load(self.m3u8_url, timeout=self.timeout, headers=self.headers)
+                break  # Successfully loaded M3U8
+            except Exception as e:
+                if self.logger_on:
+                    self.logger.error(f"Error loading {self.m3u8_url} at attempt {attempt}: {e}")    
+
+        if not playlist:
+            if self.logger_on:
+                self.logger.error("Failed to load M3U8 file.")
+            return []
+
+        self.__total_segments = len(playlist.segments)
+        segment_files = []
+        with ThreadPoolExecutor(max_workers=self.max_thread) as executor:
+            future_to_index = {
+                executor.submit(self._download_segment_, segment, idx): idx
+                for idx, segment in enumerate(playlist.segments)
+            }
+
+            for future in as_completed(future_to_index):
+                ts_filename = future.result()
+                if ts_filename:
+                    segment_files.append((future_to_index[future], ts_filename))
+                    if self.logger_on:
+                        self.logger.info(f'Downloaded file {ts_filename}')
+
+        # Sort files by index to maintain order
+        segment_files.sort()
+        self.__finish_download.set()  # Set the Event to signal the monitor thread to stop
+        speed_thread.join()
+        return [filename for _, filename in segment_files]
+
+    def merge_segments(self, segment_files: List[str]) -> None:
+        """Merge TS segments into an MP4 file using FFmpeg."""
+
+        with open(self.concat_file, "w") as f:
+            for segment in segment_files:
+                f.write(f"file '{segment}'\n")
+
+        ffmpeg.input(self.concat_file, format="concat", safe=0) \
+            .output(self.output_file, c="copy") \
+            .run(overwrite_output=True)
+
+        if self.logger_on:
+            self.logger.info(f"Saved output as {self.output_file}")
+
+        if self.clean:
+            if self.logger_on:
+                self.logger.info("Cleaning up...")
+            self._cleanup_()
+
+    def _cleanup_(self) -> None:
+        """Remove temporary TS files."""
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        os.remove(self.concat_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M3U8 Downloader and Merger")
@@ -203,34 +249,23 @@ if __name__ == "__main__":
     parser.add_argument("--logger", action="store_true", help="Enable download logging to console")
     args = parser.parse_args()
 
-    m3u8_url = args.input
-    output_file = args.output
-    temp_dir = args.tempdir
-    max_thread = args.workers
-    retries = args.retries
-    timeout = args.timeout
-    clean = args.clean
-    logger_on = args.logger
+    downloader = M3U8downloader(m3u8_url=args.input,
+                                output_file=args.output,
+                                temp_dir=args.tempdir,
+                                max_thread=args.workers,
+                                retries=args.retries,
+                                timeout=args.timeout,
+                                clean=args.clean,
+                                logger_on=args.logger)
 
-    # Start download speed monitoring in a separate thread
-    speed_thread = threading.Thread(target=monitor_speed, daemon=True)
-    speed_thread.start()
-
-    logger.info("Downloading and processing M3U8 playlist...")
-    segments = process_m3u8(m3u8_url, temp_dir, '', thread=max_thread, retries=retries, timeout=timeout)
-
-    finish_download = True
-    speed_thread.join()
+    downloader.logger.info("Downloading and processing M3U8 playlist...")
+    segments = downloader.process_m3u8()
 
     if segments:
-        logger.info("Merging segments into MP4...")
-        merge_segments(segments, output_file)
+        downloader.logger.info("Merging segments into MP4...")
+        downloader.merge_segments(segments)
     else:
-        logger.error("Error when downloading.")
-
-    if clean:
-        logger.info("Cleaning up...")
-        cleanup(temp_dir)
+        downloader.logger.error("Error when downloading.") 
 
     if segments:
-        logger.info(f"Done! The video is saved as {output_file}")
+        downloader.logger.info(f"Done! The video is saved as {args.output}")
