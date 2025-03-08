@@ -11,9 +11,27 @@ import threading
 import logging
 import argparse
 from typing import List, Optional
-from m3u8 import Segment
+from m3u8 import Segment, M3U8
 
 class M3U8downloader:
+    """
+    A class for downloading and processing M3U8 files.
+
+    Attributes:
+        headers (dict): HTTP headers used for requests.
+        m3u8_url (str): URL of the M3U8 file.
+        output_file (str): Name of the output file after download.
+        temp_dir (str): Directory for storing temporary TS files.
+        max_thread (int): Maximum number of threads for downloading.
+        retries (int): Maximum number of retry attempts for failed downloads.
+        timeout (int): Timeout in seconds for HTTP requests.
+        clean (bool): Whether to clean up temporary files after download.
+        logger_on (bool): Whether to enable logging.
+        concat_file (str): File name for storing the TS file concatenation list.
+
+    Methods:
+        __init__: Initializes the M3U8Downloader with the provided parameters.
+    """
 
     def __init__(self,
                  m3u8_url: str = 'example.m3u8',
@@ -23,36 +41,51 @@ class M3U8downloader:
                  retries: int = 5,
                  timeout: int = 10,
                  clean: bool = False,
-                 logger_on: bool = False,
+                 logger: bool = False,
                  headers: dict = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0'
+                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0'
                  },
                  concat_file: str = 'concat_list.txt'
-                ):
-        self.headers = headers
-        self.m3u8_url = m3u8_url
-        self.output_file = output_file
-        self.temp_dir = temp_dir
-        self.max_thread = max_thread
-        self.retries = retries
-        self.timeout = timeout
-        self.clean = clean
-        self.logger_on = logger_on
-        self.concat_file = concat_file
+                 ):
+        """
+        Initialize the M3U8Downloader.
 
-        self.__total_segments: int = 0
-        self.__downloaded_segments: int = 0
-        self.__downloaded_bytes: int = 0
-        self.__wr_lock: threading.Lock = threading.Lock()
-        self.__byte_lock: threading.Lock = threading.Lock()
-        self.__finish_download: threading.Event = threading.Event()  # Use threading.Event for thread safety
+        Args:
+            m3u8_url: URL of the M3U8 file. Defaults to 'example.m3u8'.
+            output_file: Name of the output file after download. Defaults to 'video.mp4'.
+            temp_dir: Directory for storing temporary TS files. Defaults to 'temp_ts'.
+            max_thread: Maximum number of threads for downloading. Defaults to 8.
+            retries: Maximum number of retry attempts for failed downloads. Defaults to 5.
+            timeout: Timeout in seconds for HTTP requests. Defaults to 10.
+            clean: Whether to clean up temporary files after download. Defaults to False.
+            logger: Whether to enable logging. Defaults to False.
+            headers: HTTP headers used for requests. Defaults to a simulated browser User-Agent.
+            concat_file: File name for storing the TS file concatenation list. Defaults to 'concat_list.txt'.
+        """
+        self.headers = headers  # HTTP headers used for requests
+        self.m3u8_url = m3u8_url  # URL of the M3U8 file
+        self.output_file = output_file  # Name of the output file after download
+        self.temp_dir = temp_dir  # Directory for storing temporary TS files
+        self.max_thread = max_thread  # Maximum number of threads for downloading
+        self.retries = retries  # Maximum number of retry attempts for failed downloads
+        self.timeout = timeout  # Timeout in seconds for HTTP requests
+        self.clean = clean  # Whether to clean up temporary files after download
+        self.logger_on = logger  # Whether to enable logging
+        self.concat_file = concat_file  # File name for storing the TS file concatenation list
 
-        self.__key_cache: dict = {}
-        self.__key_cache_lock: threading.Lock = threading.Lock()
+        self.__total_segments: int = 0  # Total number of TS file segments
+        self.__downloaded_segments: int = 0  # Number of downloaded TS file segments
+        self.__downloaded_bytes: int = 0  # Total number of downloaded bytes
+        self.__wr_lock: threading.Lock = threading.Lock()  # Lock for thread-safe writing
+        self.__byte_lock: threading.Lock = threading.Lock()  # Lock for thread-safe byte updates
+        self.__finish_download: threading.Event = threading.Event()  # Event to signal completion of download
+
+        self.__key_cache: dict = {}  # Cache for encryption keys
+        self.__key_cache_lock: threading.Lock = threading.Lock()  # Lock for thread-safe access to key cache
         # Configure logging
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger(__name__)
-
+        self.logger = logging.getLogger(__name__)  # Get logger instance
+    
     def _format_speed_(self, bytes_per_sec: int) -> str:
         """Format speed to suitable unit."""
         units = ["B/s", "KB/s", "MB/s", "GB/s"]
@@ -160,7 +193,6 @@ class M3U8downloader:
                         f.write(decrypted_data)
                     if self.logger_on:
                         self.logger.info(f'Decrypted {segment_url}')
-            
             with self.__wr_lock:
                 self.__downloaded_segments += 1
             
@@ -169,28 +201,42 @@ class M3U8downloader:
         else:
             return None
 
+    def _get_playlist_(self) -> M3U8 | None :
+        for attempt in range(self.retries):
+            try:
+                playlist = m3u8.load(self.m3u8_url, timeout=self.timeout, headers=self.headers)
+                return playlist  # Successfully loaded M3U8
+            except Exception as e:
+                if self.logger_on:
+                    self.logger.error(f"Error loading {self.m3u8_url} at attempt {attempt}: {e}")
+        return None
+
     def process_m3u8(self) -> List[str]:
         """Process M3U8 playlist and download segments using multi-threading."""
 
         # Start download speed monitoring in a separate thread
+        self.__finish_download.clear()
         speed_thread = threading.Thread(target=self._monitor_speed_, daemon=True)
         speed_thread.start()
 
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        playlist = None
-        for attempt in range(self.retries):
-            try:
-                playlist = m3u8.load(self.m3u8_url, timeout=self.timeout, headers=self.headers)
-                break  # Successfully loaded M3U8
-            except Exception as e:
-                if self.logger_on:
-                    self.logger.error(f"Error loading {self.m3u8_url} at attempt {attempt}: {e}")    
+        playlist = self._get_playlist_()  
 
         if not playlist:
             if self.logger_on:
                 self.logger.error("Failed to load M3U8 file.")
             return []
+
+        while playlist.playlists:
+            sorted_playlists = sorted(
+                playlist.playlists,
+                key=lambda p: p.stream_info.resolution[0] * p.stream_info.resolution[1],
+                reverse=True
+            )
+            selected_playlist = sorted_playlists[0]
+            self.m3u8_url = urljoin(self.m3u8_url, selected_playlist.uri)
+            playlist = self._get_playlist_()
 
         self.__total_segments = len(playlist.segments)
         segment_files = []
@@ -211,6 +257,8 @@ class M3U8downloader:
         segment_files.sort()
         self.__finish_download.set()  # Set the Event to signal the monitor thread to stop
         speed_thread.join()
+        with self.__wr_lock:
+            self.__downloaded_segments = 0
         return [filename for _, filename in segment_files]
 
     def merge_segments(self, segment_files: List[str]) -> None:
@@ -256,7 +304,7 @@ if __name__ == "__main__":
                                 retries=args.retries,
                                 timeout=args.timeout,
                                 clean=args.clean,
-                                logger_on=args.logger)
+                                logger=args.logger)
 
     downloader.logger.info("Downloading and processing M3U8 playlist...")
     segments = downloader.process_m3u8()

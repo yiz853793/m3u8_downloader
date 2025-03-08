@@ -5,6 +5,7 @@
 This script downloads an M3U8 playlist and merges the downloaded TS segments into an MP4 file. It supports multi-threaded downloads, decryption of AES-128 encrypted segments, and cleanup of temporary files.
 
 ## Features
+- **Object-Oriented Design**: Now implemented as a class (`M3U8downloader`) for better modularity and reusability.
 - Multi-threaded downloads for faster processing
 - AES-128 decryption for encrypted TS segments
 - Progress tracking and speed monitoring
@@ -21,7 +22,7 @@ This script downloads an M3U8 playlist and merges the downloaded TS segments int
 ```bash
 git clone https://github.com/yiz853793/m3u8_downloader.git
 cd m3u8_downloader
-``` 
+```
 
 2. Install the required dependencies:
 
@@ -33,6 +34,29 @@ pip install -r requirements.txt
 
 ```bash
 python m3u8_downloader.py -i <m3u8_url> -o <output_file> -t <temp_dir> -w <workers> -r <retries> -to <timeout> --clean --logger
+```
+
+Alternatively, you can import the class in your own Python script:
+
+```python
+from m3u8_downloader import M3U8downloader
+
+downloader = M3U8downloader(m3u8_url='https://example.com/playlist.m3u8',
+                            output_file='video.mp4',
+                            max_thread=8,
+                            retries=5,
+                            timeout=10,
+                            clean=True,
+                            logger_on=True)
+
+downloader.logger.info("Downloading and processing M3U8 playlist...")
+segments = downloader.process_m3u8()
+
+if segments:
+    downloader.logger.info("Merging segments into MP4...")
+    downloader.merge_segments(segments)
+else:
+    downloader.logger.error("Error when downloading.")
 ```
 
 # Argument
