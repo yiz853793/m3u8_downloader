@@ -8,11 +8,136 @@ from urllib.parse import urljoin, urlparse, urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import threading
+from threading import Thread
 import logging
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Callable
 from m3u8 import Segment, M3U8
 
+class Queue:
+
+    def __init__(self):
+        self.queue = []
+        self.wrlock = threading.Lock()
+
+    def push(self, item):
+        with self.wrlock:
+            self.queue.append(item)
+    
+    def pop(self):
+        with self.wrlock:
+            if self._empty_():
+                raise Exception('empty')
+            return self.queue.pop(0)
+        
+    def _empty_(self):
+        return len(self.queue) == 0
+
+class factory:
+    
+    def __init__(self, retries: int, function : Callable, next_factory: 'factory', threads: int = 8, logger=None):
+        self.queue = Queue()
+        self.workers = threads
+        self.function = function
+        self.__last_finish = threading.Event()
+        self.next_factory = next_factory
+        self.retries = retries
+        self.logger_on = logger
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(__name__)  # Get logger instance
+    
+    def push(self, item):
+        self.queue.push(item)
+    
+    def _one_thread_(self):
+        while True:
+            try:
+                item = self.queue.pop()
+                tries = item[-1]
+                item = item[0]
+            except Exception as e:
+                if self.__last_finish.is_set():
+                    return
+                else:
+                    time.sleep(1)
+                    continue
+
+            try:
+                ans = self.function(item)
+                if self.next_factory is not None:
+                    self.next_factory.push((ans, 0))
+            except Exception as e:
+                tries += 1
+                if self.logger_on:
+                    self.logger.error(f"Error processing item at {tries} time: {e}")
+                if tries < self.retries :
+                    self.queue.push((item, tries))
+                else:
+                    self.logger.error(f'\033[31mERROR after {self.retries} times.\033[0m')
+            finally:
+                time.sleep(1)
+
+    def last_finish(self):
+        self.__last_finish.set()
+
+    def start(self):
+        self.__last_finish.clear()
+        threads : List[Thread] = []
+        for _ in range(self.workers):
+            k = threading.Thread(target=self._one_thread_, daemon=True)
+            k.start()
+            threads.append(k)
+        
+        for thread in threads:
+            thread.join()
+
+        if self.next_factory is not None:
+            self.next_factory.last_finish()
+
+class receive_factory(factory):
+    
+    def __init__(self, function=None, threads: int = 0):
+        super().__init__(function if function else lambda x: x, threads, next_factory=None)
+        self.results = []  # 用于存储结果
+    
+    def start(self):
+        pass
+    
+class pipeline:
+    def __init__(self, threads : int, retries: int, *functions : Callable, logger_on=None):
+        self.logger_on = logger_on
+        self.threads = threads
+        self.retries = retries
+        funcs = functions[::-1]
+        self.receivefactory = receive_factory()
+        next_factory = self.receivefactory
+        self.factories : List[factory] = []
+        self._factory_threads = []
+        for func in funcs:
+            facto = factory(retries=self.retries, function=func, threads= self.threads, next_factory=next_factory, logger=logger_on)
+            self.factories.append(facto)
+            next_factory = facto
+    
+    def push(self, item):
+        if self.factories :
+            self.factories[-1].push((item, 0))
+
+    def start(self):
+        self._factory_threads : List[Thread] = []
+        for factory in self.factories :
+            thread = threading.Thread(target=factory.start, daemon=True)
+            thread.start()
+            self._factory_threads.append(thread)
+    
+    def end(self):
+        if self.factories :
+            self.factories[-1].last_finish()
+        
+        for thread in self._factory_threads:
+            thread.join()
+
+        return self.receivefactory.queue.queue
+        
 class M3U8downloader:
     """
     A class for downloading and processing M3U8 files.
@@ -103,103 +228,82 @@ class M3U8downloader:
                 self.logger.info(f"\033[96mDownload Speed: {self._format_speed_(self.__downloaded_bytes)}\033[0m")
                 self.__downloaded_bytes = 0  # Reset counter every second
 
-    def _download_file_(self, url: str, filename: str) -> bool:
-        """Download a file from a URL with retries."""
-        for attempt in range(self.retries):
-            try:
-                response = requests.get(url, stream=True, timeout=self.timeout, headers=self.headers)
-                if response.status_code == 200:
-                    with open(filename, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                            with self.__byte_lock:
-                                self.__downloaded_bytes += len(chunk)
-                    if self.logger_on:
-                        self.logger.info(f"Downloaded: {url}; Saved in {filename}")
-                    time.sleep(1)
-                    return True  # Success
-                else:
-                    if self.logger_on:
-                        self.logger.error(f"Failed to download {url} at {attempt}th try, Status Code: {response.status_code}")
-                    time.sleep(2 * (attempt + 1))
-            except requests.exceptions.RequestException as e:
-                if self.logger_on:
-                    self.logger.error(f"Error downloading {url} at {attempt}th try: {e}")
-                time.sleep(2 * (attempt + 1))
-        
-        self.logger.error(f"\033[91mFailed to download {url} after {self.retries} attempts, whitch should stored in {filename}\033[0m")
-        return False  # Failed after retries
-
-    def _get_key_(self, key_url: str) -> Optional[bytes]:
-        """Download the AES decryption key."""
-        for attempt in range(self.retries):
-            try:
-                response = requests.get(key_url, stream=True, timeout=self.timeout, headers=self.headers)
-                if response.status_code == 200:
-                    return response.content
-                else:
-                    if self.logger_on:
-                        self.logger.error(f"Failed to download key: {key_url}, Status Code: {response.status_code}")
-            except requests.exceptions.RequestException as e:
-                if self.logger_on:
-                    self.logger.error(f"Error downloading {key_url} at {attempt}th try: {e}")
-        self.logger.error(f'\033[91mFailed to download key: {key_url} after {self.retries} try\033[0m')
-
-        return None
-
     def _decrypt_ts_(self, encrypted_ts: bytes, key: bytes, iv: bytes) -> bytes:
         """Decrypt a TS file using AES-128."""
         cipher = AES.new(key, AES.MODE_CBC, iv)
         return cipher.decrypt(encrypted_ts)
-
-    def _download_segment_(self, segment : Segment, idx: int) -> Optional[str]:
-        """Download a segment and decrypt if needed."""
-        key_info = None
+    
+    def _get_key_(self, item : tuple[int, Segment]):
+        idx, segment = item
         segment_url = segment.uri
         segment_url = urljoin(self.m3u8_url, segment_url)
 
         path = urlparse(segment_url).path  # Get the path part of the URL
         ext = os.path.splitext(path)[-1]   # Extract extension from path
-        
+
         if ext != '.mp4':
             ext = '.ts'
-
+        
         ts_filename = os.path.join(self.temp_dir, f"{idx}{ext}")
 
-        # Handle encryption if needed
         if segment.key and segment.key.uri:
             key_url = urljoin(self.m3u8_url, segment.key.uri)
             if key_url in self.__key_cache:
-                key_info = self.__key_cache[key_url]
-            
-            key = self._get_key_(key_url)
-
-            if key:
-                iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
-                key_info = (key, iv)  # Save key for decryption
-                with self.__key_cache_lock:
-                    self.__key_cache[key_url] = key_info
+                key, iv = self.__key_cache[key_url]
+                return (segment_url, ts_filename, key, iv)
             else:
-                return None
+                try:
+                    response = requests.get(key_url, stream=True, timeout=self.timeout, headers=self.headers)
+                    if response.status_code == 200:
+                        key = response.content
+                        iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
 
-        if self._download_file_(segment_url, ts_filename):
-            if key_info:
-                # Decrypt if encrypted
-                with open(ts_filename, "rb") as f:
-                    encrypted_data = f.read()
-                    decrypted_data = self._decrypt_ts_(encrypted_data, key_info[0], key_info[1])
+                        with self.__key_cache_lock:
+                            self.__key_cache[key_url] = (key, iv)
 
-                    with open(ts_filename, "wb") as f:
-                        f.write(decrypted_data)
-                    if self.logger_on:
-                        self.logger.info(f'Decrypted {segment_url}')
-            with self.__wr_lock:
-                self.__downloaded_segments += 1
-            
-            self.logger.info(f'\033[92m{self.__downloaded_segments}/{self.__total_segments}\033[0m Downloaded and Saved {segment_url}')
-            return ts_filename
-        else:
-            return None
+                        return (segment_url, ts_filename, key, iv)
+                    else:
+                        raise Exception(f'fail to download {key_url}')
+                except requests.exceptions.RequestException as e:
+                    raise Exception(e)
+        else :
+            return (segment_url, ts_filename, None, None)
+
+    def _dycrept_(self, item : tuple[str, str, bytes, bytes]):
+        segment_url ,ts_filename, key, iv = item
+        
+        with open(ts_filename, "rb") as f:
+            encrypted_data = f.read()
+            if key:
+                decrypted_data = self._decrypt_ts_(encrypted_data, key, iv)
+            else:
+                decrypted_data = encrypted_data
+        
+        with open(ts_filename, "wb") as f:
+            f.write(decrypted_data)
+
+        with self.__wr_lock:
+            self.__downloaded_segments += 1
+        
+        self.logger.info(f'\033[92m{self.__downloaded_segments}/{self.__total_segments}\033[0m Downloaded and Saved {segment_url}')
+
+        return ts_filename
+
+    def _download_ts_(self, item : tuple[str, str, bytes, bytes]):
+        segment_url, ts_filename, key, iv = item
+        try:
+            response = requests.get(url = segment_url, headers= self.headers, timeout=self.timeout)
+            if response.status_code == 200:
+                with open(ts_filename, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        with self.__byte_lock:
+                            self.__downloaded_bytes += len(chunk)
+                return (segment_url, ts_filename, key, iv)
+            else :
+                raise Exception(f'Fail to download {segment_url}')
+        except requests.exceptions.RequestException as e:
+            raise Exception(e)
 
     def _get_playlist_(self) -> M3U8 | None :
         for attempt in range(self.retries):
@@ -239,27 +343,19 @@ class M3U8downloader:
             playlist = self._get_playlist_()
 
         self.__total_segments = len(playlist.segments)
-        segment_files = []
-        with ThreadPoolExecutor(max_workers=self.max_thread) as executor:
-            future_to_index = {
-                executor.submit(self._download_segment_, segment, idx): idx
-                for idx, segment in enumerate(playlist.segments)
-            }
 
-            for future in as_completed(future_to_index):
-                ts_filename = future.result()
-                if ts_filename:
-                    segment_files.append((future_to_index[future], ts_filename))
-                    if self.logger_on:
-                        self.logger.info(f'Downloaded file {ts_filename}')
-
-        # Sort files by index to maintain order
+        pipe = pipeline(self.max_thread, self.retries, self._get_key_, self._download_ts_, self._dycrept_, logger_on=self.logger_on)
+        
+        for idx, segment in enumerate(playlist.segments):
+            pipe.push((idx, segment))
+        pipe.start()
+        segment_files = pipe.end()
         segment_files.sort()
         self.__finish_download.set()  # Set the Event to signal the monitor thread to stop
         speed_thread.join()
         with self.__wr_lock:
             self.__downloaded_segments = 0
-        return [filename for _, filename in segment_files]
+        return [filename for filename, _ in segment_files]
 
     def merge_segments(self, segment_files: List[str]) -> None:
         """Merge TS segments into an MP4 file using FFmpeg."""
