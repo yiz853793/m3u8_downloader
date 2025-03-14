@@ -100,7 +100,7 @@ class receive_factory(factory):
     
     def __init__(self, function=None, threads: int = 0):
         super().__init__(retries=0, function=function if function else lambda x: x, threads=threads, next_factory=None)
-        self.results = []  # 用于存储结果
+        self.results = []
     
     def start(self):
         pass
@@ -335,10 +335,10 @@ class M3U8downloader:
         speed_thread.join()
         with self.__wr_lock:
             self.__downloaded_segments = 0
-        segment_files = sorted(segment_files)
         return [file_names for file_names, _ in segment_files]
 
     def merge_segments(self, segment_files: List[str]) -> None:
+        segment_files = sorted(segment_files, key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split('\\')[-1]))
         with open(self.concat_file, "w") as f:
             for segment in segment_files:
                 f.write(f"file '{segment}'\n")
