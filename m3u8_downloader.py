@@ -12,6 +12,7 @@ import logging
 import argparse
 from typing import List, Optional, Callable, Tuple, Generator, Any
 from m3u8 import Segment, M3U8
+from collections import deque
 
 class Queue:
     """
@@ -26,10 +27,11 @@ class Queue:
         """
         Initialize an empty queue with a write lock.
         """
-        self.queue = []
+        self.front_queue = deque()
+        self.back_queue = deque()
         self.wrlock = threading.Lock()
 
-    def push(self, item):
+    def front_push(self, item):
         """
         Add an item to the end of the queue.
 
@@ -37,7 +39,11 @@ class Queue:
             item: The item to be added to the queue.
         """
         with self.wrlock:
-            self.queue.append(item)
+            self.front_queue.append(item)
+    
+    def back_push(self, item):
+        with self.wrlock:
+            self.back_queue.append(item)
     
     def pop(self):
         """
@@ -50,18 +56,20 @@ class Queue:
             Exception: If the queue is empty.
         """
         with self.wrlock:
-            if self._empty_():
-                raise Exception('empty')
-            return self.queue.pop(0)
+            if len(self.front_queue) > 0:
+                return self.front_queue.popleft()
+            if len(self.back_queue) > 0:
+                return self.back_queue.popleft()
+            raise Exception('empty')
         
-    def _empty_(self):
-        """
-        Check if the queue is empty.
+    # def _empty_(self):
+    #     """
+    #     Check if the queue is empty.
 
-        Returns:
-            True if the queue is empty, False otherwise.
-        """
-        return len(self.queue) == 0
+    #     Returns:
+    #         True if the queue is empty, False otherwise.
+    #     """
+    #     return len(self.queue) == 0
 
 class factory:
     """
@@ -96,10 +104,13 @@ class factory:
         self.workers = threads
         self.function = function
         self.__last_finish = threading.Event()
+        self.__finish = threading.Event()
         self.next_factory = next_factory
         self.retries = retries
         self.on_retry = on_retry
         self.on_drop = on_drop
+        self.delay_queue = [[] for _ in range(60)]
+        self.delay_wrlock = threading.Lock()
     
     def push(self, item):
         """
@@ -108,8 +119,19 @@ class factory:
         Args:
             item: The item to be processed.
         """
-        self.queue.push(item)
+        self.queue.back_push(item)
     
+    def _delay_empty_(self):
+        with self.delay_wrlock:
+            return all(len(slot) == 0 for slot in self.delay_queue)
+
+    def _process_delay_queue_(self):
+        while not self.__finish.is_set():
+            time.sleep(1)
+            with self.delay_wrlock:
+                for item in self.delay_queue[0]: self.queue.front_push(item)
+                self.delay_queue = self.delay_queue[1:] + [[]]
+
     def _one_thread_(self):
         """
         The main processing loop for a worker thread.
@@ -120,7 +142,7 @@ class factory:
                 tries = item[-1]
                 item = item[0]
             except Exception as e:
-                if self.__last_finish.is_set():
+                if self._delay_empty_() and self.__last_finish.is_set():
                     return
                 else:
                     time.sleep(1)
@@ -136,7 +158,9 @@ class factory:
                 if self.on_retry:
                     self.on_retry(e, tries, item)
                 if tries < self.retries :
-                    self.queue.push((item, tries))
+                    delay = min(2 ** (tries - 1), 60)
+                    slot = delay - 1
+                    self.delay_queue[slot].append((item, tries))
                 else:
                     if self.on_drop:
                         self.on_drop(e, self.retries, item)
@@ -154,6 +178,9 @@ class factory:
         Start the factory's worker threads.
         """
         self.__last_finish.clear()
+        self.__finish.clear()
+        delay_thread = threading.Thread(target=self._process_delay_queue_, daemon=True)
+        delay_thread.start()
         threads : List[Thread] = []
         for _ in range(self.workers):
             k = threading.Thread(target=self._one_thread_, daemon=True)
@@ -165,6 +192,8 @@ class factory:
 
         if self.next_factory is not None:
             self.next_factory.last_finish()
+        self.__finish.set()
+        delay_thread.join()
 
 class receive_factory(factory):
     """
