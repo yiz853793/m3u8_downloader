@@ -16,11 +16,12 @@ from collections import deque
 
 class Queue:
     """
-    A thread-safe queue for managing items to be processed.
+    A thread-safe queue implementation with front and back queues for prioritized processing.
 
     Attributes:
-        queue (list): The underlying list used to store queue items.
-        wrlock (threading.Lock): A lock to ensure thread-safe operations on the queue.
+        front_queue (deque): Queue for high-priority items
+        back_queue (deque): Queue for normal-priority items
+        wrlock (threading.Lock): A lock to ensure thread-safe operations on both queues
     """
 
     def __init__(self):
@@ -33,27 +34,33 @@ class Queue:
 
     def front_push(self, item):
         """
-        Add an item to the end of the queue.
+        Add an item to the front queue (high priority).
 
         Args:
-            item: The item to be added to the queue.
+            item: The item to be added to the front queue
         """
         with self.wrlock:
             self.front_queue.append(item)
     
     def back_push(self, item):
+        """
+        Add an item to the back queue (normal priority).
+
+        Args:
+            item: The item to be added to the back queue
+        """
         with self.wrlock:
             self.back_queue.append(item)
     
     def pop(self):
         """
-        Remove and return the first item from the queue.
+        Remove and return an item from the queues, prioritizing front queue items.
 
         Returns:
-            The first item in the queue.
+            The first item from the front queue if available, otherwise from the back queue
 
         Raises:
-            Exception: If the queue is empty.
+            Exception: If both queues are empty
         """
         with self.wrlock:
             if len(self.front_queue) > 0:
@@ -73,17 +80,20 @@ class Queue:
 
 class factory:
     """
-    A base factory class for creating processing pipelines with retry and error handling capabilities.
+    A base factory class for creating processing pipelines with retry, delay, and error handling capabilities.
 
     Attributes:
-        queue (Queue): The queue for holding items to be processed.
-        workers (int): Number of worker threads.
-        function (Callable): The processing function to be executed.
-        __last_finish (threading.Event): An event to signal when processing is finished.
-        next_factory (factory): The next factory in the pipeline.
-        retries (int): Number of retry attempts for failed operations.
-        on_retry (Callable): Callback function for retry attempts.
-        on_drop (Callable): Callback function for dropped items after maximum retries.
+        queue (Queue): The queue for holding items to be processed
+        workers (int): Number of worker threads
+        function (Callable): The processing function to be executed
+        __last_finish (threading.Event): Event to signal when processing is finished
+        __finish (threading.Event): Event to signal when factory should stop
+        next_factory (factory): The next factory in the pipeline
+        retries (int): Number of retry attempts for failed operations
+        delay_queue (List[List]): Array of 60 slots for delayed retry items
+        delay_wrlock (threading.Lock): Lock for delay queue operations
+        on_retry (Callable): Callback function for retry attempts
+        on_drop (Callable): Callback function for dropped items after maximum retries
     """
 
     def __init__(self, retries: int, function: Callable, next_factory: 'factory', threads: int = 8, 
@@ -126,6 +136,10 @@ class factory:
             return all(len(slot) == 0 for slot in self.delay_queue)
 
     def _process_delay_queue_(self):
+        """
+        Process the delay queue every second, moving items from delay slots to the main queue.
+        Items in slot 0 are moved to the main queue, and all slots are shifted left.
+        """
         while not self.__finish.is_set():
             time.sleep(1)
             with self.delay_wrlock:
@@ -197,10 +211,11 @@ class factory:
 
 class receive_factory(factory):
     """
-    A specialized factory for receiving results from the processing pipeline.
+    A specialized factory for collecting results from the processing pipeline.
+    Stores results in a list instead of passing them to next factory.
 
     Attributes:
-        results (list): List to store the results received.
+        results (list): List to store the processed results
     """
 
     def __init__(self, function=None, threads: int = 0):
@@ -215,6 +230,13 @@ class receive_factory(factory):
         self.results = []
     
     def push(self, item):
+        """
+        Add a processed item to the results list.
+        Extracts the actual item from the (item, tries) tuple.
+
+        Args:
+            item: Tuple containing the processed item and its retry count
+        """
         self.results.append(item[0])
 
     def start(self):
@@ -645,7 +667,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", default="output.mp4", help="Output filename")
     parser.add_argument("-t", "--tempdir", default="temp_ts", help="Temporary directory")
     parser.add_argument("-w", "--workers", type=int, default=8, help="Thread count")
-    parser.add_argument("-r", "--retries", type=int, default=5, help="Retry attempts")
+    parser.add_argument("-r", "--retries", type=int, default=10, help="Retry attempts")
     parser.add_argument("-to", "--timeout", type=int, default=10, help="Request timeout")
     parser.add_argument("--clean", action="store_true", help="Clean temporary files")
     parser.add_argument("--logger", action="store_true", help="Enable logging")
