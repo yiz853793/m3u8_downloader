@@ -12,6 +12,16 @@ This script downloads an M3U8 playlist and merges the downloaded TS segments int
 - Customizable output file name and temporary directory
 - Cleanup option to remove temporary files after merging
 
+## New Features
+
+### Fragmented MP4 Support
+The downloader now supports downloading and merging fragmented MP4 (.m4s) segments:
+- Automatically detects fragmented MP4 format (init.mp4 + .m4s segments)
+- Uses FFmpeg concat protocol for efficient merging
+- No temporary concat file needed for .m4s merging
+
+Example M3U8 structure for fragmented MP4:
+
 ## Requirements
 - Python 3.6 or higher
 - Required libraries: `requests`, `m3u8`, `pycryptodome`, `ffmpeg-python`

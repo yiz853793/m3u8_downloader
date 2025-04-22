@@ -13,6 +13,7 @@ import argparse
 from typing import List, Optional, Callable, Tuple, Generator, Any
 from m3u8 import Segment, M3U8
 from collections import deque
+from pathlib import Path
 
 class Queue:
     """
@@ -172,7 +173,7 @@ class factory:
                 if self.on_retry:
                     self.on_retry(e, tries, item)
                 if tries < self.retries :
-                    delay = min(2 ** (tries - 1), 60)
+                    delay = min(2 * tries, 60)
                     slot = delay - 1
                     self.delay_queue[slot].append((item, tries))
                 else:
@@ -218,15 +219,12 @@ class receive_factory(factory):
         results (list): List to store the processed results
     """
 
-    def __init__(self, function=None, threads: int = 0):
+    def __init__(self):
         """
         Initialize a receive factory.
-
-        Args:
-            function: The processing function (optional).
-            threads: Number of worker threads (default is 0).
+        Uses a default lambda function as the processing function.
         """
-        super().__init__(retries=0, function=function if function else lambda x: x, threads=threads, next_factory=None)
+        super().__init__(retries=0, function=lambda x: x, threads=0, next_factory=None)
         self.results = []
     
     def push(self, item):
@@ -392,10 +390,10 @@ class M3U8downloader:
         Format bytes per second into a human-readable string.
 
         Args:
-            bytes_per_sec: Bytes per second to be formatted.
+            bytes_per_sec: Number of bytes per second to format.
 
         Returns:
-            Formatted speed string.
+            A formatted string representing the speed (e.g., "1.23 MB/s").
         """
         units = ["B/s", "KB/s", "MB/s", "GB/s"]
         unit_index = 0
@@ -406,7 +404,8 @@ class M3U8downloader:
 
     def _monitor_speed_(self) -> None:
         """
-        Monitor and log the download speed.
+        Monitor and log the download speed every second.
+        Runs in a separate thread until __finish_download is set.
         """
         while not self.__finish_download.is_set():
             time.sleep(1)
@@ -417,12 +416,12 @@ class M3U8downloader:
 
     def _decrypt_ts_(self, encrypted_ts: bytes, key: bytes, iv: bytes) -> bytes:
         """
-        Decrypt encrypted TS segment data.
+        Decrypt encrypted TS segment data using AES-CBC.
 
         Args:
-            encrypted_ts: Encrypted TS segment data.
-            key: Decryption key.
-            iv: Initialization vector.
+            encrypted_ts: The encrypted TS segment data.
+            key: The decryption key.
+            iv: The initialization vector.
 
         Returns:
             Decrypted TS segment data.
@@ -430,7 +429,7 @@ class M3U8downloader:
         cipher = AES.new(key, AES.MODE_CBC, iv)
         return cipher.decrypt(encrypted_ts)
     
-    def _get_key_(self, item : Tuple[int, Segment]) -> Generator[Tuple[str, str, Optional[bytes], Optional[bytes]], Any, None]:
+    def _get_key_(self, item: Tuple[int, Segment]) -> Generator[Tuple[str, int, str, Optional[bytes], Optional[bytes]], Any, None]:
         """
         Retrieve the decryption key for a TS segment.
 
@@ -438,7 +437,12 @@ class M3U8downloader:
             item: Tuple containing segment index and segment information.
 
         Yields:
-            Tuple containing segment URL, TS filename, decryption key, and IV.
+            Tuple containing:
+                - segment URL
+                - segment index
+                - TS filename
+                - decryption key (if encrypted)
+                - IV (if encrypted)
         """
         idx, segment = item
         segment_url = segment.uri
@@ -447,12 +451,12 @@ class M3U8downloader:
         path = urlparse(segment_url).path
         ext = os.path.splitext(path)[-1]
 
-        if ext != '.mp4':
+        if ext != '.mp4' and ext != '.m4s':
             ext = '.ts'
         
         ts_filename = os.path.join(self.temp_dir, f"{idx}{ext}")
         key, iv = None, None
-        if segment.key and segment.key.uri:
+        if isinstance(segment, Segment) and segment.key and segment.key.uri:
             key_url = urljoin(self.m3u8_url, segment.key.uri)
             if key_url in self.__key_cache:
                 key, iv = self.__key_cache[key_url]
@@ -470,98 +474,101 @@ class M3U8downloader:
 
                 except requests.exceptions.RequestException as e:
                     raise Exception(f'Key download error: {e}')
-        yield (segment_url, ts_filename, key, iv)
+        yield (segment_url, idx, ts_filename, key, iv)
 
-    def _get_key_retry_(self, exception : Exception, tries : int, item : Tuple[int, Segment]):
+    def _get_key_retry_(self, exception: Exception, tries: int, item: Tuple[int, Segment]):
         """
-        Handle retry for key download.
+        Handle retry attempts for key download failures.
 
         Args:
             exception: The exception that occurred.
-            tries: Number of retry attempts.
+            tries: Current retry attempt number.
             item: Tuple containing segment index and segment information.
         """
         if self.logger_on:
             key_url = urljoin(self.m3u8_url, item[1].key.uri)
             self.logger.error(f'Error downloading key {key_url} at {tries} try : {exception}')
     
-    def _get_key_error_(self, exception : Exception, tries : int, item : Tuple[int, Segment]):
+    def _get_key_error_(self, exception: Exception, tries: int, item: Tuple[int, Segment]):
         """
-        Handle error after maximum retries for key download.
+        Handle final error after all retry attempts for key download have failed.
 
         Args:
             exception: The exception that occurred.
-            tries: Number of retry attempts.
+            tries: Total number of retry attempts made.
             item: Tuple containing segment index and segment information.
         """
         # if self.logger_on:
         key_url = urljoin(self.m3u8_url, item[1].key.uri)
         self.logger.error(f'\033[91mError\033[0m downloading key {key_url} after {tries} tries : {exception}')
 
-    def _download_ts_(self, item : Tuple[str, str, Optional[bytes], Optional[bytes]]) -> Generator[Tuple[str, str, bytes, bytes], Any, None]:
+    def _download_ts_(self, item: Tuple[str, int, str, Optional[bytes], Optional[bytes]]) -> Generator[Tuple[str, int, str, bytes, bytes], Any, None]:
         """
-        Download a TS segment.
+        Download a TS/M4S segment.
 
         Args:
-            item: Tuple containing segment URL, TS filename, decryption key, and IV.
+            item: Tuple containing segment URL, index, filename, key, and IV.
 
         Yields:
-            Tuple containing segment URL, TS filename, decryption key, and IV.
+            Tuple containing the downloaded segment information.
+
+        Raises:
+            Exception: If download fails or HTTP status is not 200.
         """
-        segment_url, ts_filename, key, iv = item
+        segment_url, idx, ts_filename, key, iv = item
         try:
             response = requests.get(url=segment_url, headers=self.headers, timeout=self.timeout, stream=True)
             if response.status_code == 200:
                 with open(ts_filename, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=16384):
+                    for chunk in response.iter_content(chunk_size=max(16384, 1024 * self.max_thread)):
                         f.write(chunk)
                         with self.__byte_lock:
                             self.__downloaded_bytes += len(chunk)
                     if self.logger_on:
-                        self.logger.info(f'Sucess downloading {segment_url}')
-                yield (segment_url, ts_filename, key, iv)
+                        self.logger.info(f'Sucess downloading {segment_url} to {ts_filename}')
+                yield (segment_url, idx, ts_filename, key, iv)
             else:
                 raise Exception(f'HTTP {response.status_code} for {segment_url}')
         except requests.exceptions.RequestException as e:
             raise Exception(f'Download error: {e}')
 
-    def _download_ts_retry_(self, exception : Exception, tries : int, item : Tuple[str, str, Optional[bytes], Optional[bytes]]):
+    def _download_ts_retry_(self, exception: Exception, tries: int, item: Tuple[str, int, str, Optional[bytes], Optional[bytes]]):
         """
-        Handle retry for TS segment download.
+        Handle retry attempts for segment download failures.
 
         Args:
             exception: The exception that occurred.
-            tries: Number of retry attempts.
-            item: Tuple containing segment URL, TS filename, decryption key, and IV.
+            tries: Current retry attempt number.
+            item: Tuple containing segment information.
         """
         if self.logger_on:
-            segment_url, ts_filename, key, iv = item
+            segment_url, idx,  ts_filename, key, iv = item
             self.logger.error(f'Error downloading {segment_url} at {tries} try : {exception}')
     
-    def _download_ts_error_(self, exception : Exception, tries : int, item : Tuple[str, str, Optional[bytes], Optional[bytes]]):
+    def _download_ts_error_(self, exception: Exception, tries: int, item: Tuple[str, int, str, Optional[bytes], Optional[bytes]]):
         """
-        Handle error after maximum retries for TS segment download.
+        Handle final error after all retry attempts for segment download have failed.
 
         Args:
             exception: The exception that occurred.
-            tries: Number of retry attempts.
-            item: Tuple containing segment URL, TS filename, decryption key, and IV.
+            tries: Total number of retry attempts made.
+            item: Tuple containing segment information.
         """
         # if self.logger_on:
-        segment_url, ts_filename, key, iv = item
+        segment_url, idx, ts_filename, key, iv = item
         self.logger.error(f'''\033[91mError\033[0m downloading {segment_url}, whitch should store at {ts_filename}, key is {key}, iv is {iv}.''')
 
-    def _dycrept_(self, item : Tuple[str, str, Optional[bytes], Optional[bytes]]) -> Generator[str, Any, None]:
+    def _dycrept_(self, item: Tuple[str, int, str, Optional[bytes], Optional[bytes]]) -> Generator[Tuple[str, int], Any, None]:
         """
-        Decrypt a TS segment if necessary.
+        Decrypt a segment if encryption is used.
 
         Args:
-            item: Tuple containing segment URL, TS filename, decryption key, and IV.
+            item: Tuple containing segment URL, index, filename, key, and IV.
 
         Yields:
-            Filename of the processed TS segment.
+            Tuple containing the processed segment filename and index.
         """
-        segment_url, ts_filename, key, iv = item
+        segment_url, idx, ts_filename, key, iv = item
         with open(ts_filename, "rb") as f:
             encrypted_data = f.read()
         decrypted_data = self._decrypt_ts_(encrypted_data, key, iv) if key else encrypted_data
@@ -571,14 +578,14 @@ class M3U8downloader:
             self.__downloaded_segments += 1
         # if self.logger:
         self.logger.info(f'\033[92m{self.__downloaded_segments}/{self.__total_segments}\033[0m Processed {segment_url}')
-        yield ts_filename
+        yield (ts_filename, idx)
     
     def _get_playlist_(self) -> Optional[M3U8]:
         """
         Retrieve and parse the M3U8 playlist.
 
         Returns:
-            Parsed M3U8 playlist object or None if retrieval fails.
+            Parsed M3U8 playlist object or None if retrieval fails after all retries.
         """
         for attempt in range(self.retries):
             try:
@@ -591,9 +598,10 @@ class M3U8downloader:
     def process_m3u8(self) -> List[str]:
         """
         Process the M3U8 playlist and download all segments.
+        Handles both regular TS segments and fragmented MP4 segments.
 
         Returns:
-            List of TS segment filenames.
+            List of downloaded segment filenames in correct order.
         """
         self.__finish_download.clear()
         speed_thread = threading.Thread(target=self._monitor_speed_, daemon=True)
@@ -605,7 +613,7 @@ class M3U8downloader:
             if self.logger_on:
                 self.logger.error("Failed to load M3U8 playlist")
             return []
-
+        # playlist.segment_map[0].
         while playlist.playlists:
             best_quality = max(playlist.playlists, 
                               key=lambda p: p.stream_info.resolution[0] * p.stream_info.resolution[1])
@@ -625,13 +633,15 @@ class M3U8downloader:
                 self.max_thread, self.retries, self._dycrept_, None, None
             )
         )
-        
+        if playlist.segment_map:
+            pipe.push((-1, playlist.segment_map[0]))
         for idx, segment in enumerate(playlist.segments):
             pipe.push((idx, segment))
         pipe.start()
         segment_files = pipe.end()
         self.__finish_download.set()
-        segment_files = sorted(segment_files, key=lambda x: int(os.path.splitext(os.path.basename(x))[0].split('\\')[-1]))
+        segment_files = sorted(segment_files, key=lambda x: x[1])
+        segment_files = [x[0] for x in segment_files]
         speed_thread.join()
         with self.__wr_lock:
             self.__downloaded_segments = 0
@@ -639,27 +649,63 @@ class M3U8downloader:
 
     def merge_segments(self, segment_files: List[str]) -> None:
         """
-        Merge downloaded TS segments into a single video file.
+        Merge downloaded segments into a single video file.
+        Supports both TS segments and fragmented MP4 (.m4s) segments.
+
+        For fragmented MP4:
+        - Uses FFmpeg concat protocol to merge init.mp4 and .m4s segments
+        - No concat file is generated in this case
+
+        For TS segments:
+        - Uses FFmpeg concat demuxer
+        - Generates a temporary concat file listing all segments
 
         Args:
-            segment_files: List of TS segment filenames.
+            segment_files: List of segment filenames to merge.
         """
-        with open(self.concat_file, "w") as f:
-            for segment in segment_files:
-                f.write(f"file '{segment}'\n")
-        ffmpeg.input(self.concat_file, format="concat", safe=0)\
-              .output(self.output_file, c="copy").run(overwrite_output=True)
+        if not segment_files:
+            if self.logger_on:
+                self.logger.error("No segments to merge.")
+            return
+
+        # Check if segments are fragmented MP4 format
+        is_m4s = all(Path(seg).suffix == '.m4s' for seg in segment_files if seg != segment_files[0])
+        is_init_mp4 = Path(segment_files[0]).suffix == '.mp4'
+
+        if is_m4s and is_init_mp4:
+            # Use concat protocol for init.mp4 + .m4s segments
+            concat_str = "concat:" + "|".join(Path(seg).as_posix() for seg in segment_files)
+            if self.logger_on:
+                self.logger.info("Merging fragmented MP4 using concat protocol")
+            ffmpeg.input(concat_str).output(self.output_file, c="copy").run(overwrite_output=True)
+        else:
+            # Fallback to concat demuxer for TS or complete MP4 files
+            with open(self.concat_file, "w") as f:
+                for segment in segment_files:
+                    segment = Path(segment).as_posix()
+                    f.write(f"file '{segment}'\n")
+            if self.logger_on:
+                self.logger.info("Merging segments using -f concat")
+            ffmpeg.input(self.concat_file, format="concat", safe=0)\
+                  .output(self.output_file, c="copy").run(overwrite_output=True)
+
         if self.logger_on:
             self.logger.info(f"Merged output to {self.output_file}")
+
         if self.clean:
             self._cleanup_()
 
     def _cleanup_(self) -> None:
         """
-        Clean up temporary files.
+        Clean up temporary files and directories.
+        
+        Operations:
+        - Removes the temporary directory containing downloaded segments
+        - Safely removes the concat file if it exists (used for TS segment merging)
         """
         shutil.rmtree(self.temp_dir, ignore_errors=True)
-        os.remove(self.concat_file)
+        if os.path.exists(self.concat_file):
+            os.remove(self.concat_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M3U8 Downloader")
@@ -667,7 +713,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", default="output.mp4", help="Output filename")
     parser.add_argument("-t", "--tempdir", default="temp_ts", help="Temporary directory")
     parser.add_argument("-w", "--workers", type=int, default=8, help="Thread count")
-    parser.add_argument("-r", "--retries", type=int, default=10, help="Retry attempts")
+    parser.add_argument("-r", "--retries", type=int, default=5, help="Retry attempts")
     parser.add_argument("-to", "--timeout", type=int, default=10, help="Request timeout")
     parser.add_argument("--clean", action="store_true", help="Clean temporary files")
     parser.add_argument("--logger", action="store_true", help="Enable logging")
