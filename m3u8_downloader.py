@@ -343,7 +343,7 @@ class M3U8downloader:
                  clean: bool = False,
                  logger: bool = False,
                  headers: dict = {
-                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0'
+                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/133.0.0.0'
                  },
                  concat_file: str = 'concat_list.txt'
                  ):
@@ -622,6 +622,9 @@ class M3U8downloader:
 
         self.__total_segments = len(playlist.segments)
 
+        if playlist.segment_map:
+            self.__total_segments += 1
+
         pipe = pipeline(
             (
                 self.max_thread, self.retries, self._get_key_, self._get_key_retry_, self._get_key_error_    
@@ -673,14 +676,34 @@ class M3U8downloader:
         is_init_mp4 = Path(segment_files[0]).suffix == '.mp4'
 
         if is_m4s and is_init_mp4:
-            # Use concat protocol for init.mp4 + .m4s segments
-            concat_str = "concat:" + "|".join(Path(seg).as_posix() for seg in segment_files)
-            if self.logger_on:
-                self.logger.info("Merging fragmented MP4 using concat protocol")
-            ffmpeg.input(concat_str).output(self.output_file, c="copy").run(overwrite_output=True)
+            # Divide into manageable chunks
+            init_segment = segment_files[0]
+            m4s_segments = segment_files[1:]
+            max_concat = 100  # number of files per chunk
+            intermediate_files = []
+
+            for i in range(0, len(m4s_segments), max_concat):
+                chunk = m4s_segments[i:i+max_concat]
+                chunk_input = [init_segment] + chunk
+                concat_str = "concat:" + "|".join(Path(f).as_posix() for f in chunk_input)
+                chunk_output = f"{self.output_file}.part{i//max_concat}.mp4"
+                ffmpeg.input(concat_str).output(chunk_output, c="copy").run(overwrite_output=True)
+                intermediate_files.append(chunk_output)
+
+            # Now merge intermediate files with concat demuxer
+            with open(self.concat_file, "w", encoding="utf-8") as f:
+                for fpath in intermediate_files:
+                    f.write(f"file '{Path(fpath).as_posix()}'\n")
+
+            ffmpeg.input(self.concat_file, format="concat", safe=0)\
+                .output(self.output_file, c="copy").run(overwrite_output=True)
+
+            # Optionally clean up intermediate parts
+            for fpath in intermediate_files:
+                os.remove(fpath)
         else:
             # Fallback to concat demuxer for TS or complete MP4 files
-            with open(self.concat_file, "w") as f:
+            with open(self.concat_file, "w", encoding="utf-8") as f:
                 for segment in segment_files:
                     segment = Path(segment).as_posix()
                     f.write(f"file '{segment}'\n")
