@@ -3,6 +3,7 @@ import threading
 from threading import Thread
 from typing import List, Optional, Callable, Tuple, Generator, Any
 from collections import deque
+import heapq
 
 class Queue:
     """
@@ -103,42 +104,51 @@ class factory:
         self.retries = retries
         self.on_retry = on_retry
         self.on_drop = on_drop
-        self.delay_queue = [[] for _ in range(60)]
-        self.delay_wrlock = threading.Lock()
-    
+        self._delay_heap = []  # (expire_time, (data, tries))
+        self._wait_task_cv = threading.Condition()
+        self._delay_queue_cv = threading.Condition()
+
     def push(self, item):
         """
-        Add an item to the factory's queue.
-
-        Args:
-            item: The item to be processed.
+        Add an item to the factory's queue and notify waiting threads.
         """
         self.queue.back_push(item)
+        with self._delay_queue_cv:
+            self._delay_queue_cv.notify()
     
     def _delay_empty_(self):
-        with self.delay_wrlock:
-            return all(len(slot) == 0 for slot in self.delay_queue)
+        with self._delay_queue_cv:
+            return len(self._delay_heap) == 0
 
     def _process_delay_queue_(self):
         """
-        Process the delay queue every second, moving items from delay slots to the main queue.
-        Items in slot 0 are moved to the main queue, and all slots are shifted left.
+        Efficiently handle delayed retry tasks using a priority queue and condition variable.
         """
         while not self.__finish.is_set():
-            time.sleep(1)
-            with self.delay_wrlock:
-                for item in self.delay_queue[0]: self.queue.front_push(item)
-                self.delay_queue = self.delay_queue[1:] + [[]]
+            with self._delay_queue_cv:
+                while not self._delay_heap:
+                    self._delay_queue_cv.wait(timeout=1)
+                    if self.__finish.is_set():
+                        return
+                expire, item = self._delay_heap[0]
+                now = time.time()
+                if expire > now:
+                    self._delay_queue_cv.wait(timeout=expire-now)
+                    continue
+                # When expired, pop and push to the main queue
+                heapq.heappop(self._delay_heap)
+                self.queue.front_push(item)
 
     def _one_thread_(self):
         """
-        The main processing loop for a worker thread.
+        Main processing loop for a worker thread.
         """
         while True:
-            # 先检查是否可以安全退出
-            while self.queue.empty():
-                if self._delay_empty_() and self.__last_finish.is_set():
-                    return
+            with self._wait_task_cv:
+                while self.queue.empty():
+                    if self._delay_empty_() and self.__last_finish.is_set():
+                        return
+                    self._wait_task_cv.wait(timeout=1)
 
             try:
                 item = self.queue.pop()
@@ -157,8 +167,10 @@ class factory:
                     if self.on_retry:
                         self.on_retry(e, tries, data)
                     delay = min(2 * tries, 60)
-                    slot = delay - 1
-                    self.delay_queue[slot].append((data, tries))
+                    expire = time.time() + delay
+                    with self._delay_queue_cv:
+                        heapq.heappush(self._delay_heap, (expire, (data, tries)))
+                        self._delay_queue_cv.notify()
                 else:
                     if self.on_drop:
                         self.on_drop(e, self.retries, data)
@@ -179,13 +191,13 @@ class factory:
         self.__finish.clear()
         delay_thread = threading.Thread(target=self._process_delay_queue_, daemon=True)
         delay_thread.start()
-        threads : List[Thread] = []
+        self.__threads : List[Thread] = []
         for _ in range(self.workers):
             k = threading.Thread(target=self._one_thread_, daemon=True)
             k.start()
-            threads.append(k)
+            self.__threads.append(k)
         
-        for thread in threads:
+        for thread in self.__threads:
             thread.join()
 
         if self.next_factory is not None:

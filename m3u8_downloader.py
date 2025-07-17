@@ -332,7 +332,7 @@ class M3U8downloader:
         if playlist.segment_map:
             self.__total_segments += 1
 
-        pipe = pipeline(
+        self.pipe = pipeline(
             (
                 self.max_thread, self.retries, self._get_key_, self._get_key_retry_, self._get_key_error_    
             ),
@@ -344,11 +344,11 @@ class M3U8downloader:
             )
         )
         if playlist.segment_map:
-            pipe.push((-1, playlist.segment_map[0]))
+            self.pipe.push((-1, playlist.segment_map[0]))
         for idx, segment in enumerate(playlist.segments):
-            pipe.push((idx, segment))
-        pipe.start()
-        segment_files = pipe.end()
+            self.pipe.push((idx, segment))
+        self.pipe.start()
+        segment_files = self.pipe.end()
         self.__finish_download.set()
         segment_files = sorted(segment_files, key=lambda x: x[1])
         segment_files = [x[0] for x in segment_files]
