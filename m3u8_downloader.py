@@ -4,6 +4,7 @@ import requests
 import shutil
 import ffmpeg
 from Crypto.Cipher import AES
+from requests.adapters import HTTPAdapter
 from urllib.parse import urljoin, urlparse
 import time
 import threading
@@ -13,6 +14,31 @@ from typing import List, Optional, Callable, Tuple, Generator, Any
 from m3u8 import Segment, M3U8
 from pathlib import Path
 from pipeline import pipeline
+
+
+class _RequestsSessionHTTPClient:
+    """
+    Adapter used by m3u8.load so playlist requests can reuse the downloader's
+    requests.Session connection pool instead of opening a separate urllib
+    connection for each playlist load.
+    """
+
+    def __init__(self, request: Callable[..., requests.Response]):
+        self.request = request
+
+    def download(self, uri, timeout=None, headers=None, verify_ssl=True):
+        with self.request(
+            "GET",
+            uri,
+            timeout=timeout,
+            headers=headers or {},
+            verify=verify_ssl,
+        ) as response:
+            response.raise_for_status()
+            base_uri = urljoin(response.url, ".")
+            encoding = response.encoding or "utf-8"
+            return response.content.decode(encoding), base_uri
+
 
 class M3U8downloader:
     """
@@ -49,9 +75,7 @@ class M3U8downloader:
                  timeout: int = 10,
                  clean: bool = False,
                  logger: bool = False,
-                 headers: dict = {
-                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/133.0.0.0'
-                 },
+                 headers: Optional[dict] = None,
                  concat_file: str = 'concat_list.txt'
                  ):
         """
@@ -69,7 +93,9 @@ class M3U8downloader:
             headers: HTTP headers to be used in requests (default is a generic User-Agent).
             concat_file: Filename for the concatenation list (default is 'concat_list.txt').
         """
-        self.headers = headers
+        self.headers = headers.copy() if headers is not None else {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/133.0.0.0'
+        }
         self.m3u8_url = m3u8_url
         self.output_file = output_file
         self.temp_dir = temp_dir
@@ -89,8 +115,94 @@ class M3U8downloader:
 
         self.__key_cache: dict = {}
         self.__key_cache_lock: threading.Lock = threading.Lock()
+        self.__session_request_lock: threading.Lock = threading.Lock()
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
+
+        self.__session_pool_size = 0
+        self.__session_closed = False
+        self._init_session_()
+
+    def _init_session_(self) -> None:
+        """
+        Initialize a reusable HTTP session and mount connection-pool adapters.
+        """
+        self.session = requests.Session()
+        self.__playlist_http_client = _RequestsSessionHTTPClient(self._request_)
+        self.__session_closed = False
+        self.__session_pool_size = 0
+        self._configure_session_pool_()
+
+    def _configure_session_pool_(self) -> None:
+        """
+        Keep up to max_thread persistent connections per host for concurrent
+        segment downloads. pool_block=True prevents requests from creating
+        throwaway overflow connections when all pooled connections are busy.
+        """
+        pool_size = max(1, int(self.max_thread))
+        if pool_size == self.__session_pool_size:
+            return
+
+        old_adapters = [
+            self.session.adapters.get("http://"),
+            self.session.adapters.get("https://"),
+        ]
+
+        self.session.mount(
+            "http://",
+            HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+                pool_block=True,
+            ),
+        )
+        self.session.mount(
+            "https://",
+            HTTPAdapter(
+                pool_connections=pool_size,
+                pool_maxsize=pool_size,
+                pool_block=True,
+            ),
+        )
+
+        for adapter in set(old_adapters):
+            if adapter:
+                adapter.close()
+
+        self.__session_pool_size = pool_size
+
+    def _ensure_session_(self) -> None:
+        """
+        Reopen the reusable session if the caller closed it and then reused the
+        downloader instance.
+        """
+        if self.__session_closed:
+            self._init_session_()
+        else:
+            self._configure_session_pool_()
+
+    def _request_(self, method: str, url: str, **kwargs) -> requests.Response:
+        """
+        Issue a request through the reusable session. Only Session.request is
+        locked; streaming response bodies are consumed outside the lock.
+        """
+        with self.__session_request_lock:
+            self._ensure_session_()
+            return self.session.request(method, url, **kwargs)
+
+    def close(self) -> None:
+        """
+        Release pooled HTTP connections held by this downloader.
+        """
+        self.session.close()
+        self.__session_closed = True
+
+    def __enter__(self):
+        self._ensure_session_()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
     
     def _format_speed_(self, bytes_per_sec: int) -> str:
         """
@@ -170,11 +282,11 @@ class M3U8downloader:
                     
             if key == None:
                 try:
-                    response = requests.get(key_url, stream=True, timeout=self.timeout, headers=self.headers)
-                    if not (200 <= response.status_code < 300):  # all 2xx status_code is sucecess
-                        raise Exception(f'Failed to download key: {key_url}')
-                        
-                    key = response.content
+                    with self._request_("GET", key_url, timeout=self.timeout, headers=self.headers) as response:
+                        if not (200 <= response.status_code < 300):  # all 2xx status_code is success
+                            raise Exception(f'Failed to download key: {key_url}')
+
+                        key = response.content
                     iv = bytes.fromhex(segment.key.iv[2:]) if segment.key.iv else b"\x00" * 16
                     with self.__key_cache_lock:
                         self.__key_cache[key_url] = (key, iv)
@@ -224,18 +336,18 @@ class M3U8downloader:
         """
         segment_url, idx, ts_filename, key, iv = item
         try:
-            response = requests.get(url=segment_url, headers=self.headers, timeout=self.timeout, stream=True)
-            if 200 <= response.status_code < 300:
-                with open(ts_filename, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=max(16384, 1024 * self.max_thread)):
-                        f.write(chunk)
-                        with self.__byte_lock:
-                            self.__downloaded_bytes += len(chunk)
-                    if self.logger_on:
-                        self.logger.info(f'Sucess downloading {segment_url} to {ts_filename}')
-                yield (segment_url, idx, ts_filename, key, iv)
-            else:
-                raise Exception(f'HTTP {response.status_code} for {segment_url}')
+            with self._request_("GET", segment_url, headers=self.headers, timeout=self.timeout, stream=True) as response:
+                if 200 <= response.status_code < 300:
+                    with open(ts_filename, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=max(16384, 1024 * self.max_thread)):
+                            f.write(chunk)
+                            with self.__byte_lock:
+                                self.__downloaded_bytes += len(chunk)
+                        if self.logger_on:
+                            self.logger.info(f'Sucess downloading {segment_url} to {ts_filename}')
+                    yield (segment_url, idx, ts_filename, key, iv)
+                else:
+                    raise Exception(f'HTTP {response.status_code} for {segment_url}')
         except requests.exceptions.RequestException as e:
             raise Exception(f'Download error: {e}')
 
@@ -296,7 +408,13 @@ class M3U8downloader:
         """
         for attempt in range(self.retries):
             try:
-                return m3u8.load(self.m3u8_url, timeout=self.timeout, headers=self.headers)
+                self._ensure_session_()
+                return m3u8.load(
+                    self.m3u8_url,
+                    timeout=self.timeout,
+                    headers=self.headers,
+                    http_client=self.__playlist_http_client,
+                )
             except Exception as e:
                 if self.logger_on:
                     self.logger.error(f"Playlist load attempt {attempt+1} failed: {e}")
@@ -310,6 +428,7 @@ class M3U8downloader:
         Returns:
             List of downloaded segment filenames in correct order.
         """
+        self._ensure_session_()
         self.__finish_download.clear()
         speed_thread = threading.Thread(target=self._monitor_speed_, daemon=True)
         speed_thread.start()
@@ -472,6 +591,8 @@ class M3U8downloader:
             self.temp_dir = temp_dir
         if max_thread is not None:
             self.max_thread = max_thread
+            if not self.__session_closed:
+                self._configure_session_pool_()
         if retries is not None:
             self.retries = retries
         if timeout is not None:
@@ -481,7 +602,7 @@ class M3U8downloader:
         if logger is not None:
             self.logger_on = logger
         if headers is not None:
-            self.headers = headers
+            self.headers = headers.copy()
         if concat_file is not None:
             self.concat_file = concat_file
 
@@ -510,14 +631,17 @@ if __name__ == "__main__":
         concat_file=args.concat
     )
 
-    if args.logger:
-        downloader.logger.info("Starting download process...")
-    segments = downloader.process_m3u8()
-     
-    if segments:
-        downloader.merge_segments(segments)
+    try:
         if args.logger:
-            downloader.logger.info(f"Successfully saved to {args.output}")
-    else:
-        if args.logger:
-            downloader.logger.error("Download failed")
+            downloader.logger.info("Starting download process...")
+        segments = downloader.process_m3u8()
+
+        if segments:
+            downloader.merge_segments(segments)
+            if args.logger:
+                downloader.logger.info(f"Successfully saved to {args.output}")
+        else:
+            if args.logger:
+                downloader.logger.error("Download failed")
+    finally:
+        downloader.close()
