@@ -171,7 +171,7 @@ class M3U8downloader:
             if key == None:
                 try:
                     response = requests.get(key_url, stream=True, timeout=self.timeout, headers=self.headers)
-                    if response.status_code != 200:
+                    if not (200 <= response.status_code < 300):  # all 2xx status_code is sucecess
                         raise Exception(f'Failed to download key: {key_url}')
                         
                     key = response.content
@@ -220,12 +220,12 @@ class M3U8downloader:
             Tuple containing the downloaded segment information.
 
         Raises:
-            Exception: If download fails or HTTP status is not 200.
+            Exception: If download fails or HTTP status is not in 2xx range.
         """
         segment_url, idx, ts_filename, key, iv = item
         try:
             response = requests.get(url=segment_url, headers=self.headers, timeout=self.timeout, stream=True)
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 with open(ts_filename, "wb") as f:
                     for chunk in response.iter_content(chunk_size=max(16384, 1024 * self.max_thread)):
                         f.write(chunk)
@@ -394,7 +394,11 @@ class M3U8downloader:
                 chunk_input = [init_segment] + chunk
                 concat_str = "concat:" + "|".join(Path(f).as_posix() for f in chunk_input)
                 chunk_output = f"{self.output_file}.part{i//max_concat}.mp4"
-                ffmpeg.input(concat_str).output(chunk_output, c="copy").run(overwrite_output=True)
+                try:
+                    ffmpeg.input(concat_str).output(chunk_output, c="copy").global_args('-v', 'info', '-stats', '-hide_banner').run(overwrite_output=True, capture_stdout=False, capture_stderr=False)
+                except ffmpeg.Error as e:
+                    stderr_output = e.stderr.decode('utf-8') if e.stderr else "No stderr output"
+                    raise Exception(f'FFmpeg error: {stderr_output}')
                 intermediate_files.append(chunk_output)
 
             # Now merge intermediate files with concat demuxer
@@ -402,8 +406,14 @@ class M3U8downloader:
                 for fpath in intermediate_files:
                     f.write(f"file '{Path(fpath).as_posix()}'\n")
 
-            ffmpeg.input(self.concat_file, format="concat", safe=0)\
-                .output(self.output_file, c="copy").run(overwrite_output=True)
+            try:
+                ffmpeg.input(self.concat_file, format="concat", safe=0)\
+                    .output(self.output_file, c="copy", strict="-1")\
+                    .global_args('-v', 'info', '-stats', '-hide_banner')\
+                    .run(overwrite_output=True, capture_stdout=False, capture_stderr=False)
+            except ffmpeg.Error as e:
+                stderr_output = e.stderr.decode('utf-8') if e.stderr else "No stderr output"
+                raise Exception(f'FFmpeg error: {stderr_output}')
 
             # Optionally clean up intermediate parts
             for fpath in intermediate_files:
@@ -416,8 +426,14 @@ class M3U8downloader:
                     f.write(f"file '{segment}'\n")
             if self.logger_on:
                 self.logger.info("Merging segments using -f concat")
-            ffmpeg.input(self.concat_file, format="concat", safe=0)\
-                  .output(self.output_file, c="copy").run(overwrite_output=True)
+            try:
+                ffmpeg.input(self.concat_file, format="concat", safe=0)\
+                    .output(self.output_file, c="copy", strict="-1")\
+                    .global_args('-v', 'info', '-stats', '-hide_banner')\
+                    .run(overwrite_output=True, capture_stdout=False, capture_stderr=False)
+            except ffmpeg.Error as e:
+                stderr_output = e.stderr.decode('utf-8') if e.stderr else "No stderr output"
+                raise Exception(f'FFmpeg error: {stderr_output}')
 
         if self.logger_on:
             self.logger.info(f"Merged output to {self.output_file}")
@@ -437,6 +453,38 @@ class M3U8downloader:
         if os.path.exists(self.concat_file):
             os.remove(self.concat_file)
 
+    def set(self, 
+            m3u8_url: str | None = None,
+            output_file: str | None = None,
+            temp_dir: str | None = None,
+            max_thread: int | None = None,
+            retries: int | None = None,
+            timeout: int | None = None,
+            clean: bool | None = None,
+            logger: bool | None = None,
+            headers: dict | None = None,
+            concat_file: str | None = None):
+        if m3u8_url is not None:
+            self.m3u8_url = m3u8_url
+        if output_file is not None:
+            self.output_file = output_file
+        if temp_dir is not None:
+            self.temp_dir = temp_dir
+        if max_thread is not None:
+            self.max_thread = max_thread
+        if retries is not None:
+            self.retries = retries
+        if timeout is not None:
+            self.timeout = timeout
+        if clean is not None:
+            self.clean = clean
+        if logger is not None:
+            self.logger_on = logger
+        if headers is not None:
+            self.headers = headers
+        if concat_file is not None:
+            self.concat_file = concat_file
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M3U8 Downloader")
     parser.add_argument("-i", "--input", required=True, help="M3U8 URL")
@@ -447,6 +495,7 @@ if __name__ == "__main__":
     parser.add_argument("-to", "--timeout", type=int, default=10, help="Request timeout")
     parser.add_argument("--clean", action="store_true", help="Clean temporary files")
     parser.add_argument("--logger", action="store_true", help="Enable logging")
+    parser.add_argument("--concat", default="concat_list.txt", help="Concatenate segments")
     args = parser.parse_args()
 
     downloader = M3U8downloader(
@@ -457,13 +506,14 @@ if __name__ == "__main__":
         retries=args.retries,
         timeout=args.timeout,
         clean=args.clean,
-        logger=args.logger
+        logger=args.logger,
+        concat_file=args.concat
     )
 
     if args.logger:
         downloader.logger.info("Starting download process...")
     segments = downloader.process_m3u8()
-    
+     
     if segments:
         downloader.merge_segments(segments)
         if args.logger:
